@@ -1,35 +1,27 @@
-/* Estilo para o nosso botão quando o modo de desenho está ativo */
-.canvas-freehand-button.is-active {
+/* styles.css */
+
+/* Estilo para o botão de ação quando o modo de desenho está ativo */
+.is-active {
     color: var(--interactive-accent);
 }
 
-/* Esta é a nossa camada de captura de eventos.
-  É uma div invisível que fica sobre o canvas nativo.
-*/
-.canvas-freehand-event-catcher {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    z-index: 99; /* Garante que fique por cima de tudo */
-
-    /* Começa desativada */
-    display: none;
-}
-
-/* Quando o modo de desenho está ativo, a camada de captura aparece */
-.canvas-freehand-event-catcher.is-active {
-    display: block;
-}
-
-/*
-  A nossa camada de desenho (<canvas>) fica DENTRO da camada de captura.
-*/
 .canvas-freehand-drawing-layer {
     position: absolute;
     top: 0;
     left: 0;
     width: 100%;
     height: 100%;
+    z-index: 10;
+    pointer-events: none;
+    transform-origin: 0 0;
+}
+
+/* Quando o modo de desenho está ativo, mudamos o cursor do contêiner principal */
+.canvas-wrapper.is-drawing-active {
+    cursor: crosshair;
+}
+
+/* Estilo para os traços SVG */
+.canvas-freehand-drawing-layer path {
+    stroke-width: 0;
 }

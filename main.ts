@@ -1,137 +1,177 @@
-import { Plugin, WorkspaceLeaf, setIcon, ItemView } from 'obsidian';
+// main.ts
+import { Plugin, WorkspaceLeaf, ItemView } from 'obsidian';
+import { getStroke } from 'perfect-freehand';
 
-interface CanvasFreehandSettings {}
-const DEFAULT_SETTINGS: CanvasFreehandSettings = {};
+// Definição de uma interface para os nossos traços
+interface Stroke {
+    points: number[][];
+    color: string;
+    thickness: number;
+    // Adicionamos uma referência ao elemento SVG para atualizações em tempo real
+    element?: SVGPathElement; 
+}
 
 export default class CanvasFreehandPlugin extends Plugin {
-	settings: CanvasFreehandSettings;
-	
-	// Map para guardar a camada de captura de cada aba
-	private eventCatchers: Map<WorkspaceLeaf, HTMLDivElement> = new Map();
-	// Map para guardar a camada de desenho de cada aba
-	private drawingLayers: Map<WorkspaceLeaf, HTMLCanvasElement> = new Map();
-	private resizeObservers: Map<WorkspaceLeaf, ResizeObserver> = new Map();
-	// Map para guardar uma referência ao botão de ação de cada aba, para o podermos remover
-	private actionButtons: Map<WorkspaceLeaf, HTMLElement> = new Map();
+    private isDrawingEnabled: boolean = false;
+    private isDrawing: boolean = false;
+    private currentStroke: Stroke | null = null;
+    private strokes: Stroke[] = [];
 
-	private currentStrokePoints: number[][] = [];
-	private isCurrentlyDrawing: boolean = false;
+    // Mapeia para guardar a camada de desenho SVG de cada aba
+    private drawingLayers: Map<WorkspaceLeaf, SVGSVGElement> = new Map();
+    private resizeObservers: Map<WorkspaceLeaf, ResizeObserver> = new Map();
+    private actionButtons: Map<WorkspaceLeaf, HTMLElement> = new Map();
+    private mutationObservers: Map<WorkspaceLeaf, MutationObserver> = new Map();
 
-	async onload() {
-		console.log('Loading Canvas Freehand Plugin');
-		await this.loadSettings();
+    async onload() {
+        console.log('Loading Canvas Freehand Plugin');
+        this.app.workspace.onLayoutReady(() => {
+            this.handleLayoutChange();
+        });
+        this.registerEvent(this.app.workspace.on('layout-change', this.handleLayoutChange.bind(this)));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', this.handleActiveLeafChange.bind(this)));
+    }
 
-		// Espera o layout do Obsidian estar pronto antes de fazer a primeira verificação.
-		this.app.workspace.onLayoutReady(() => {
-			this.onLayoutChange();
-		});
+    onunload() {
+        console.log('Unloading Canvas Freehand Plugin');
+        this.drawingLayers.forEach((_, leaf) => this.removeDrawingUI(leaf));
+    }
 
-		// O 'layout-change' continua a ser usado para detetar novas abas de Canvas abertas.
-		this.registerEvent(
-			this.app.workspace.on('layout-change', this.onLayoutChange.bind(this))
-		);
-		
-		this.registerDomEvent(window, 'pointerup', this.handlePointerUp.bind(this));
-	}
+    private handleLayoutChange() {
+        this.app.workspace.getLeavesOfType('canvas').forEach(leaf => {
+            if (!this.drawingLayers.has(leaf)) {
+                this.setupDrawingUI(leaf);
+            }
+        });
+    }
+    
+    private handleActiveLeafChange(leaf: WorkspaceLeaf | null) {
+        if (leaf && leaf.view.getViewType() === 'canvas') {
+            if (!this.drawingLayers.has(leaf)) {
+                this.setupDrawingUI(leaf);
+            }
+            // TODO: Carregar os desenhos específicos deste canvas aqui
+        }
+    }
 
-	onunload() {
-		console.log('Unloading Canvas Freehand Plugin');
-		this.removeDrawingUIFromAllCanvas();
-	}
+    private setupDrawingUI(leaf: WorkspaceLeaf) {
+        const viewContainer = leaf.view.containerEl;
+        const canvasWrapper = viewContainer.querySelector('.canvas-wrapper') as HTMLElement;
+        if (!canvasWrapper) return;
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
+        // 1. CRIAÇÃO DA CAMADA DE DESENHO SVG
+        const drawingLayer = canvasWrapper.createSvg('svg', { cls: 'canvas-freehand-drawing-layer' });
+        this.drawingLayers.set(leaf, drawingLayer);
+        
+        // 2. BOTÃO DE AÇÃO
+        const button = (leaf.view as ItemView).addAction('pencil', 'Toggle Drawing', () => this.toggleDrawingMode(leaf, button));
+        this.actionButtons.set(leaf, button);
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+        // 3. EVENTOS DE DESENHO
+        this.registerDomEvent(canvasWrapper, 'pointerdown', (evt) => this.handlePointerDown(evt, leaf));
+        this.registerDomEvent(canvasWrapper, 'pointermove', (evt) => this.handlePointerMove(evt, leaf));
+        this.registerDomEvent(window, 'pointerup', () => this.handlePointerUp(leaf));
 
-	private onLayoutChange() {
-		this.app.workspace.getLeavesOfType('canvas').forEach((leaf: WorkspaceLeaf) => {
-			this.addDrawingUIToCanvas(leaf);
-		});
-	}
+        // 4. SINCRONIZAÇÃO VIA ESPELHAMENTO DE TRANSFORMAÇÃO
+        const nativeCanvas = canvasWrapper.querySelector('.canvas') as HTMLElement;
+        if (nativeCanvas) {
+            const observer = new MutationObserver(() => {
+                drawingLayer.style.transform = nativeCanvas.style.transform;
+                drawingLayer.style.transformOrigin = nativeCanvas.style.transformOrigin;
+            });
+            observer.observe(nativeCanvas, { attributes: true, attributeFilter: ['style'] });
+            this.mutationObservers.set(leaf, observer);
+            drawingLayer.style.transform = nativeCanvas.style.transform;
+            drawingLayer.style.transformOrigin = nativeCanvas.style.transformOrigin;
+        }
+    }
 
-	/**
-	 * Função unificada para adicionar toda a nossa UI a um Canvas.
-	 */
-	private addDrawingUIToCanvas(leaf: WorkspaceLeaf) {
-		if (this.eventCatchers.has(leaf)) {
-			return;
-		}
+    private toggleDrawingMode(leaf: WorkspaceLeaf, button: HTMLElement) {
+        this.isDrawingEnabled = !this.isDrawingEnabled;
+        const canvasWrapper = leaf.view.containerEl.querySelector('.canvas-wrapper');
+        if (canvasWrapper) {
+            canvasWrapper.classList.toggle('is-drawing-active', this.isDrawingEnabled);
+            button.classList.toggle('is-active', this.isDrawingEnabled);
+        }
+    }
+    
+    private handlePointerDown(evt: PointerEvent, leaf: WorkspaceLeaf) {
+        if (!this.isDrawingEnabled) return; 
+        evt.preventDefault();
+        evt.stopPropagation();
+        this.isDrawing = true;
+        
+        this.currentStroke = {
+            points: [[evt.offsetX, evt.offsetY, evt.pressure]],
+            color: '#000000', 
+            thickness: 8,
+            element: this.createStrokeElement(leaf)
+        };
+    }
 
-		const canvasContainer = leaf.view.containerEl.querySelector('.canvas-container');
-		
-		if (canvasContainer) {
-			// --- CRIAÇÃO DAS CAMADAS ---
-			const eventCatcher = canvasContainer.createEl('div', {
-				cls: 'canvas-freehand-event-catcher'
-			});
-			this.eventCatchers.set(leaf, eventCatcher);
+    private handlePointerMove(evt: PointerEvent, leaf: WorkspaceLeaf) {
+        if (!this.isDrawingEnabled || !this.isDrawing || !this.currentStroke) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        this.currentStroke.points.push([evt.offsetX, evt.offsetY, evt.pressure]);
+        this.drawStroke(this.currentStroke);
+    }
 
-			const drawingLayer = eventCatcher.createEl('canvas', {
-				cls: 'canvas-freehand-drawing-layer'
-			});
-			this.drawingLayers.set(leaf, drawingLayer);
-			
-			// --- LÓGICA DE REDIMENSIONAMENTO ---
-			const resizeCanvas = () => {
-				drawingLayer.width = canvasContainer.clientWidth;
-				drawingLayer.height = canvasContainer.clientHeight;
-			};
-			const observer = new ResizeObserver(resizeCanvas);
-			observer.observe(canvasContainer);
-			this.resizeObservers.set(leaf, observer);
-			resizeCanvas();
+    private handlePointerUp(leaf: WorkspaceLeaf) {
+        if (!this.isDrawing || !this.currentStroke) return;
+        this.isDrawing = false;
+        
+        if (this.currentStroke.points.length > 1) {
+            this.strokes.push(this.currentStroke);
+        } else {
+            // Se o traço for muito pequeno (apenas um clique), remove o elemento SVG criado
+            this.currentStroke.element?.remove();
+        }
+        
+        this.currentStroke = null;
+        // TODO: Chamar a função de salvamento
+    }
 
-			// --- "ESCUTADORES" DE EVENTOS ---
-			this.registerDomEvent(eventCatcher, 'pointerdown', this.handlePointerDown.bind(this));
-			this.registerDomEvent(eventCatcher, 'pointermove', this.handlePointerMove.bind(this));
-			
-			// --- NOVA ABORDAGEM PARA O BOTÃO ---
-			// Usamos o método oficial da API para adicionar um botão de ação à vista.
-			const button = (leaf.view as ItemView).addAction(
-				'lucide-pencil', // Ícone
-				'Desenhar', // Tooltip
-				() => { // Callback do clique
-					const isActive = button.classList.toggle('is-active');
-					eventCatcher.classList.toggle('is-active', isActive);
-					console.log(`Modo de desenho: ${isActive ? 'Ativado' : 'Desativado'}`);
-				}
-			);
-			this.actionButtons.set(leaf, button);
-		}
-	}
+    private createStrokeElement(leaf: WorkspaceLeaf): SVGPathElement {
+        const drawingLayer = this.drawingLayers.get(leaf);
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        drawingLayer?.appendChild(path);
+        return path;
+    }
 
-	private handlePointerDown(e: PointerEvent) {
-		this.isCurrentlyDrawing = true;
-		this.currentStrokePoints = [[e.offsetX, e.offsetY, e.pressure]];
-		console.log('Iniciando traço...');
-	}
+    private drawStroke(stroke: Stroke) {
+        if (!stroke.element) return;
 
-	private handlePointerMove(e: PointerEvent) {
-		if (!this.isCurrentlyDrawing) return;
-		this.currentStrokePoints.push([e.offsetX, e.offsetY, e.pressure]);
-	}
+        const strokePoints = getStroke(stroke.points, {
+            size: stroke.thickness,
+            thinning: 0.5,
+            smoothing: 0.5,
+            streamline: 0.5,
+        });
 
-	private handlePointerUp(e: PointerEvent) {
-		if (!this.isCurrentlyDrawing) return;
-		this.isCurrentlyDrawing = false;
-		console.log('Traço finalizado com', this.currentStrokePoints.length, 'pontos.');
-		this.currentStrokePoints = [];
-	}
+        if (!strokePoints.length) return;
 
-	private removeDrawingUIFromAllCanvas() {
-		this.resizeObservers.forEach(observer => observer.disconnect());
-		this.resizeObservers.clear();
+        const pathData = strokePoints.reduce(
+            (acc, [x0, y0], i, arr) => {
+                const [x1, y1] = arr[(i + 1) % arr.length];
+                acc.push(`M ${x0} ${y0} L ${x1} ${y1}`);
+                return acc;
+            },
+            [] as string[]
+        ).join(' ');
 
-		this.eventCatchers.forEach(catcher => catcher.remove());
-		this.eventCatchers.clear();
-		
-		this.actionButtons.forEach(button => button.remove());
-		this.actionButtons.clear();
+        stroke.element.setAttribute('d', pathData);
+        stroke.element.setAttribute('fill', stroke.color);
+    }
 
-		this.drawingLayers.clear();
-	}
+    private removeDrawingUI(leaf: WorkspaceLeaf) {
+        this.resizeObservers.get(leaf)?.disconnect();
+        this.resizeObservers.delete(leaf);
+        this.drawingLayers.get(leaf)?.remove();
+        this.drawingLayers.delete(leaf);
+        this.actionButtons.get(leaf)?.remove();
+        this.actionButtons.delete(leaf);
+        this.mutationObservers.get(leaf)?.disconnect();
+        this.mutationObservers.delete(leaf);
+    }
 }
