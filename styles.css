@@ -21,7 +21,9 @@
     cursor: crosshair;
 }
 
-/* Estilo para os traços SVG */
+/* HOTFIX: tornar os paths visíveis (antes: stroke-width: 0) */
 .canvas-freehand-drawing-layer path {
-    stroke-width: 0;
+    stroke: var(--text-normal);
+    stroke-width: 2;
+    fill: none; /* manter como linha enquanto o path SVG não é fechado */
 }

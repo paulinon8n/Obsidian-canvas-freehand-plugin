@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-canvas-freehand",
-	"version": "0.1.0",
+	"version": "0.3.17",
 	"description": "Adds freehand drawing capabilities directly onto the Obsidian Canvas.",
 	"main": "main.js",
 	"scripts": {

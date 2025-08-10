@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-canvas-freehand",
 	"name": "Canvas Freehand",
-	"version": "0.1.0",
+	"version": "0.3.17",
 	"minAppVersion": "1.1.0",
 	"description": "Adds freehand drawing capabilities directly onto the Obsidian Canvas.",
 	"author": "Dr. Paulo Bernardy",
