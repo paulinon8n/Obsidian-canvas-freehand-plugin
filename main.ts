@@ -1,13 +1,16 @@
-// main.ts — v0.3.17
-// UMA ÚNICA MELHORIA: remover completamente o botão/menus de configurações
-// para eliminar efeitos colaterais no iPad. Mantém latência mínima e a
-// estabilidade do toggle (commit/cleanup + pointercancel). Nada de submenu.
+// main.ts — v0.3.18-alpha.6
+// Preview = perfect-freehand (paridade com commit) + Janela deslizante + Predictive head (lead)
+// - Visual idêntico ao commit
+// - Custo por frame limitado por TAIL (últimos pontos)
+// - Predição de 1 ponto à frente no preview para reduzir gap caneta→traço
 
 import { Plugin, WorkspaceLeaf, ItemView } from 'obsidian';
 import { getStroke } from 'perfect-freehand';
 
 interface StrokePoint { x: number; y: number; pressure: number; tiltX?: number; tiltY?: number; twist?: number; t?: number }
 interface Stroke { points: StrokePoint[]; color: string; thickness: number; element?: SVGPathElement; }
+
+type OffscreenType = OffscreenCanvas | HTMLCanvasElement;
 
 const isAppleTouchDevice = () => {
   const isMacLike = navigator.platform === 'MacIntel' && (navigator as any).maxTouchPoints > 1;
@@ -49,6 +52,18 @@ export default class CanvasFreehandPlugin extends Plugin {
   private strokesByLeaf: Map<WorkspaceLeaf, Stroke[]> = new Map();
   private redrawPending: Map<WorkspaceLeaf, number | null> = new Map();
 
+  // Windowed preview
+  private offscreenByLeaf: Map<WorkspaceLeaf, OffscreenType> = new Map();
+  private frozenUntilByLeaf: Map<WorkspaceLeaf, number> = new Map();
+  private lastFreezeTs: Map<WorkspaceLeaf, number> = new Map();
+  private readonly TAIL = 384;         // nº de pontos na cauda
+  private readonly OVERLAP = 12;       // overlap entre cache e cauda
+  private readonly FREEZE_EVERY_MS = 24;// freq. máx. de congelamento
+
+  // Predictive head (lead)
+  private readonly LEAD_MS = 12;       // quanto "à frente" prever (ms)
+  private readonly LEAD_MAX_SCR = 24;  // limite do avanço em pixels de tela
+
   async onload() {
     this.app.workspace.onLayoutReady(() => this.handleLayoutChange());
     this.registerEvent(this.app.workspace.on('layout-change', this.handleLayoutChange.bind(this)));
@@ -82,7 +97,7 @@ export default class CanvasFreehandPlugin extends Plugin {
       this.worldMatrix.set(leaf, m);
       const g = this.worldGroups.get(leaf); if (g) g.setAttribute('transform', `matrix(${m.a} ${m.b} ${m.c} ${m.d} ${m.e} ${m.f})`);
       if (this.canvasStatic.has(leaf)) this.scheduleRedraw(leaf);
-      if (!this.isDrawing) this.clearLiveCanvas(leaf);
+      if (!this.isDrawing) { this.clearLiveCanvas(leaf); this.clearOffscreen(leaf); }
     };
     syncMatrix();
     const mo = new MutationObserver(syncMatrix);
@@ -97,6 +112,7 @@ export default class CanvasFreehandPlugin extends Plugin {
       const canS = this.canvasStatic.get(leaf), canL = this.canvasLive.get(leaf);
       for (const can of [canS, canL]) if (can) { can.style.width = `${w}px`; can.style.height = `${h}px`; can.width = Math.max(1, Math.floor(w * dpr)); can.height = Math.max(1, Math.floor(h * dpr)); }
       if (this.canvasStatic.has(leaf)) this.scheduleRedraw(leaf);
+      this.clearOffscreen(leaf); // invalida cache ao mudar viewport
     };
     const ro = new ResizeObserver(updateViewport); ro.observe(host); this.resizeObservers.set(leaf, ro);
 
@@ -108,7 +124,7 @@ export default class CanvasFreehandPlugin extends Plugin {
     if (!this.strokesByLeaf.has(leaf)) this.strokesByLeaf.set(leaf, []);
   }
 
-  // ===== Helpers de superfície ativa =====
+  // ===== Helpers =====
   private getActiveSurface(leaf: WorkspaceLeaf): HTMLElement | null {
     return (this.drawingLayers.get(leaf) as unknown as HTMLElement) || this.canvasLive.get(leaf) || null;
   }
@@ -117,6 +133,11 @@ export default class CanvasFreehandPlugin extends Plugin {
     target.style.pointerEvents = active ? 'auto' : 'none';
     target.style.cursor = active ? 'crosshair' : 'default';
     (target.style as any).touchAction = active ? 'none' : 'auto'; // iPad: suprime gestos do SO quando desenhando
+  }
+  private getViewScale(leaf: WorkspaceLeaf): number {
+    const m = this.worldMatrix.get(leaf) ?? new DOMMatrix();
+    const sx = Math.hypot(m.a, m.b) || 1; // px por unidade de mundo (assumindo escala uniforme)
+    return sx;
   }
 
   // ===== SVG (desktop) =====
@@ -168,8 +189,9 @@ export default class CanvasFreehandPlugin extends Plugin {
         this.strokes.push(this.currentStroke);
       }
       this.clearLiveCanvas(leaf);
+      this.clearOffscreen(leaf);
       this.isDrawing = false; this.currentStroke = null; this.lastLivePoint.set(leaf, null);
-      // não chamar scheduleRedraw aqui para evitar wipe inesperado após navegação
+      this.frozenUntilByLeaf.set(leaf, 0); this.lastFreezeTs.set(leaf, 0);
     }
   }
 
@@ -192,6 +214,11 @@ export default class CanvasFreehandPlugin extends Plugin {
 
     const p = this.getWorldPoint(evt, leaf, surface);
     this.currentStroke = { points: [p], color: '#000000', thickness: 8 };
+
+    // reset janela
+    this.frozenUntilByLeaf.set(leaf, 0);
+    this.lastFreezeTs.set(leaf, performance.now());
+    this.clearOffscreen(leaf);
 
     if (this.canvasLive.has(leaf)) this.ensureRAF(leaf);
     this.lastLivePoint.set(leaf, p);
@@ -221,12 +248,14 @@ export default class CanvasFreehandPlugin extends Plugin {
       this.strokes.push(this.currentStroke);
     }
 
-    if (this.canvasLive.has(leaf)) this.clearLiveCanvas(leaf);
+    this.clearLiveCanvas(leaf);
+    this.clearOffscreen(leaf);
     this.lastLivePoint.set(leaf, null); this.currentStroke = null;
+    this.frozenUntilByLeaf.set(leaf, 0); this.lastFreezeTs.set(leaf, 0);
   }
 
   private handlePointerCancel(leaf: WorkspaceLeaf) {
-    if (!this.currentStroke) { this.clearLiveCanvas(leaf); return; }
+    if (!this.currentStroke) { this.clearLiveCanvas(leaf); this.clearOffscreen(leaf); return; }
     const stroke = this.currentStroke; this.isDrawing = false;
     if (stroke.points.length > 1) {
       if (this.canvasStatic.has(leaf)) {
@@ -235,7 +264,9 @@ export default class CanvasFreehandPlugin extends Plugin {
       }
       this.strokes.push(stroke);
     }
-    this.clearLiveCanvas(leaf); this.lastLivePoint.set(leaf, null); this.currentStroke = null;
+    this.clearLiveCanvas(leaf); this.clearOffscreen(leaf);
+    this.lastLivePoint.set(leaf, null); this.currentStroke = null;
+    this.frozenUntilByLeaf.set(leaf, 0); this.lastFreezeTs.set(leaf, 0);
   }
 
   // ===== Desktop (SVG) =====
@@ -247,7 +278,10 @@ export default class CanvasFreehandPlugin extends Plugin {
     });
     if (!pts.length) return;
     const d = pts.map((p, i) => (i === 0 ? `M ${p[0]} ${p[1]}` : `L ${p[0]} ${p[1]}`)).join(' ') + ' Z';
-    stroke.element.setAttribute('d', d); stroke.element.setAttribute('fill', stroke.color); stroke.element.setAttribute('stroke', 'none');
+    stroke.element.setAttribute('d', d);
+    // Inline style para não brigar com CSS externo
+    stroke.element.style.fill = stroke.color;
+    stroke.element.style.stroke = 'none';
   }
 
   private findLeafByStroke(stroke: Stroke): WorkspaceLeaf | null {
@@ -270,28 +304,111 @@ export default class CanvasFreehandPlugin extends Plugin {
     this.liveQueue.set(leaf, []);
   }
 
-  private flushLiveCanvas(leaf: WorkspaceLeaf) {
-    const can = this.canvasLive.get(leaf); if (!can) return; const ctx = can.getContext('2d'); if (!ctx) return;
-    const q = this.liveQueue.get(leaf); if (!q || q.length === 0) return;
+  private getOffscreen(leaf: WorkspaceLeaf): OffscreenType | null {
+    const live = this.canvasLive.get(leaf); if (!live) return null;
+    let off = this.offscreenByLeaf.get(leaf) ?? null;
+    const needW = live.width, needH = live.height;
+    const make = () => {
+      try { return new (window as any).OffscreenCanvas(needW, needH) as OffscreenCanvas; } catch { const c = document.createElement('canvas'); c.width = needW; c.height = needH; return c; }
+    };
+    if (!off) { off = make(); this.offscreenByLeaf.set(leaf, off); }
+    // resize se necessário
+    if ((off as any).width !== needW || (off as any).height !== needH) {
+      (off as any).width = needW; (off as any).height = needH;
+      const ctx = (off as any).getContext('2d'); ctx?.setTransform(1,0,0,1,0,0); ctx?.clearRect(0,0,needW,needH);
+    }
+    return off;
+  }
 
+  private clearOffscreen(leaf: WorkspaceLeaf) {
+    const off = this.offscreenByLeaf.get(leaf); if (!off) return;
+    const ctx = (off as any).getContext('2d'); if (!ctx) return;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,(off as any).width,(off as any).height);
+    this.frozenUntilByLeaf.set(leaf, 0);
+  }
+
+  private flushLiveCanvas(leaf: WorkspaceLeaf) {
+    const can = this.canvasLive.get(leaf); if (!can) return;
+    const ctx = can.getContext('2d'); if (!ctx) return;
+    const q = this.liveQueue.get(leaf); if (!q || q.length === 0) return;
+    if (!this.currentStroke) { q.splice(0, q.length); return; }
+
+    const ptsAll = this.currentStroke.points;
+    const n = ptsAll.length;
+    let frozenUntil = this.frozenUntilByLeaf.get(leaf) ?? 0;
+
+    // 0) Freeze (se necessário): envia bloco antigo para offscreen
+    const now = performance.now();
+    if (n - frozenUntil > this.TAIL && now - (this.lastFreezeTs.get(leaf) ?? 0) >= this.FREEZE_EVERY_MS) {
+      const end = n - this.TAIL + this.OVERLAP; // mantemos overlap
+      const chunk = ptsAll.slice(frozenUntil, Math.max(frozenUntil + 1, end));
+      const off = this.getOffscreen(leaf);
+      if (off) {
+        const octx = (off as any).getContext('2d') as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+        if (octx && chunk.length > 1) {
+          // desenha o polígono do chunk no offscreen, já em espaço de tela
+          const dpr = window.devicePixelRatio || 1; const m = this.worldMatrix.get(leaf) ?? new DOMMatrix();
+          // acumulativo: não limpamos o offscreen; apenas setamos a transform atual e pintamos por cima
+          octx.setTransform(dpr, 0, 0, dpr, 0, 0); (octx as any).transform(m.a, m.b, m.c, m.d, m.e, m.f);
+          const input = chunk.map(p => [p.x, p.y, Math.max(0, Math.min(1, p.pressure ?? 0.5))] as number[]);
+          const poly = getStroke(input, { size: this.currentStroke!.thickness, thinning: 0.5, smoothing: 0.5, streamline: 0.5, simulatePressure: false });
+          if (poly.length > 0) {
+            octx.beginPath(); octx.moveTo(poly[0][0], poly[0][1]); for (let i = 1; i < poly.length; i++) octx.lineTo(poly[i][0], poly[i][1]); octx.closePath();
+            (octx as any).fillStyle = this.currentStroke!.color; (octx as any).fill();
+          }
+          this.lastFreezeTs.set(leaf, now);
+          frozenUntil = Math.max(frozenUntil, end - this.OVERLAP); // mantém overlap
+          this.frozenUntilByLeaf.set(leaf, frozenUntil);
+        }
+      }
+    }
+
+    // 1) Limpa overlay
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, can.width, can.height);
+
+    // 2) Desenha o offscreen já pronto (pixels de tela)
+    const off = this.offscreenByLeaf.get(leaf);
+    if (off) ctx.drawImage(off as any, 0, 0);
+
+    // 3) Cauda: últimos TAIL pontos (a partir de frozenUntil)
+    const startTail = Math.max(frozenUntil, n - this.TAIL);
+    const tail = ptsAll.slice(startTail, n);
+
+    // 3.1) Predictive head — adiciona 1 ponto previsto SÓ no preview
+    let tailWithPrediction = tail;
+    if (tail.length >= 2) {
+      const p1 = tail[tail.length - 2];
+      const p2 = tail[tail.length - 1];
+      const dt = Math.max(1, (p2.t ?? now) - (p1.t ?? (now - 16)));
+      const dx = p2.x - p1.x, dy = p2.y - p1.y; // mundo
+      const v_world = Math.hypot(dx, dy) / dt;  // mundo/ms
+      const scale = this.getViewScale(leaf);    // px por mundo
+      const v_px = v_world * scale;             // px/ms
+      const lead_px = Math.min(this.LEAD_MAX_SCR, v_px * this.LEAD_MS);
+      if (lead_px > 0.1) {
+        const h = Math.hypot(dx, dy) || 1e-6; const ux = dx / h, uy = dy / h;
+        const lead_world = lead_px / Math.max(1e-6, scale);
+        const pPred: StrokePoint = { x: p2.x + ux * lead_world, y: p2.y + uy * lead_world, pressure: p2.pressure, t: (p2.t ?? now) + this.LEAD_MS };
+        tailWithPrediction = tail.concat(pPred);
+      }
+    }
+
+    // 4) Desenha cauda (+ previsão) com a MESMA transform do commit
     const dpr = window.devicePixelRatio || 1; const m = this.worldMatrix.get(leaf) ?? new DOMMatrix();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
 
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#000000';
-
-    let prev = this.lastLivePoint.get(leaf) || q[0];
-    const pts = q.splice(0, q.length);
-
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      const base = this.currentStroke?.thickness ?? 8;
-      const w = Math.max(0.5, base * (0.2 + 0.8 * (p.pressure || 0.5)));
-      ctx.lineWidth = w;
-      ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(p.x, p.y); ctx.stroke();
-      prev = p;
+    if (tailWithPrediction.length > 1) {
+      const input = tailWithPrediction.map(p => [p.x, p.y, Math.max(0, Math.min(1, (p as any).pressure ?? 0.5))] as number[]);
+      const poly = getStroke(input, { size: this.currentStroke!.thickness, thinning: 0.5, smoothing: 0.5, streamline: 0.5, simulatePressure: false });
+      if (poly.length > 0) { ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]); for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]); ctx.closePath(); ctx.fillStyle = this.currentStroke!.color; ctx.fill(); }
     }
 
-    this.lastLivePoint.set(leaf, prev);
+    // 5) Consome fila e mantém RAF viva
+    const pts = q.splice(0, q.length);
+    const last = this.currentStroke.points[this.currentStroke.points.length - 1] || this.lastLivePoint.get(leaf) || pts[pts.length - 1];
+    if (last) this.lastLivePoint.set(leaf, last);
   }
 
   private scheduleRedraw(leaf: WorkspaceLeaf) {
@@ -303,7 +420,6 @@ export default class CanvasFreehandPlugin extends Plugin {
   private redrawAllStrokes(leaf: WorkspaceLeaf) {
     const can = this.canvasStatic.get(leaf); if (!can) return; const ctx = can.getContext('2d'); if (!ctx) return;
     const strokes = this.strokesByLeaf.get(leaf) ?? [];
-    // Evitar apagar o buffer se não temos nada para redesenhar (cenário após navegação)
     if (strokes.length === 0) return;
 
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, can.width, can.height);
@@ -349,5 +465,6 @@ export default class CanvasFreehandPlugin extends Plugin {
     this.strokesByLeaf.delete(leaf);
     const rafId = this.rafHandle.get(leaf); if (rafId) cancelAnimationFrame(rafId); this.rafHandle.set(leaf, null);
     const rId = this.redrawPending.get(leaf); if (rId) cancelAnimationFrame(rId); this.redrawPending.set(leaf, null);
+    this.offscreenByLeaf.delete(leaf); this.frozenUntilByLeaf.delete(leaf); this.lastFreezeTs.delete(leaf);
   }
 }
